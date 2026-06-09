@@ -1301,3 +1301,238 @@ ALTER TABLE Reservations
 CREATE NONCLUSTERED INDEX idx_reservations_dates 
 	ON Reservations(DateFrom, DateTo);
 
+
+CREATE DATABASE NaszeWozki;
+GO
+
+USE NaszeWozki;
+GO
+
+-- 1. Klienci
+CREATE TABLE Klient (
+    klient_id   INT             IDENTITY(1,1) PRIMARY KEY,
+    imie        NVARCHAR(100)   NULL,         -- Może być NULL przy defaultowym dodawaniu z procedury
+    nazwisko    NVARCHAR(50)    NOT NULL,
+    email       NVARCHAR(255)   NULL,
+    telefon     NVARCHAR(20)    NULL,
+    adres       NVARCHAR(255)   NULL,
+    miasto      NVARCHAR(100)   NULL,
+    kraj        NVARCHAR(100)   NULL
+);
+
+-- 2. Wózki Widłowe
+CREATE TABLE Wozek (
+    wozek_id    INT             IDENTITY(1,1) PRIMARY KEY,
+    model       NVARCHAR(100)   NOT NULL,
+    kategoria   NVARCHAR(100)   NOT NULL,
+    udzwig      DECIMAL(10,2)   NOT NULL,
+    cena        MONEY           NOT NULL
+);
+
+-- 3. Części
+CREATE TABLE Czesc (
+    czesc_id        INT             IDENTITY(1,1) PRIMARY KEY,
+    nazwa           NVARCHAR(100)   NOT NULL,
+    typ_czesci      NVARCHAR(50)    NOT NULL,
+    material        NVARCHAR(50)    NOT NULL,
+    kraj_produkcji  NVARCHAR(100)   NOT NULL,
+    masa            DECIMAL(10,2)   NOT NULL
+);
+
+-- 4. Skład Wózka (Tabela łącząca)
+CREATE TABLE Sklad_Wozka (
+    wozek_id    INT             NOT NULL CONSTRAINT FK_Sklad_Wozek REFERENCES Wozek(wozek_id),
+    czesc_id    INT             NOT NULL CONSTRAINT FK_Sklad_Czesc REFERENCES Czesc(czesc_id),
+    ilosc_sztuk INT             NOT NULL,
+    CONSTRAINT PK_Sklad_Wozka PRIMARY KEY (wozek_id, czesc_id)
+);
+
+-- 5. Nagłówek Zamówienia
+CREATE TABLE Zamowienie (
+    zamowienie_id           INT             IDENTITY(1,1) PRIMARY KEY,
+    klient_id               INT             NOT NULL CONSTRAINT FK_Zamowienie_Klient REFERENCES Klient(klient_id),
+    data_zlozenia           DATETIME        NOT NULL DEFAULT GETDATE(),
+    termin_realizacji       DATE            NOT NULL,
+    dominujacy_material     NVARCHAR(50)    NOT NULL,
+    wspolczynnik_zlozonosci DECIMAL(18,2)   NOT NULL
+);
+
+-- 6. Detale Zamówienia (zgodnie z wymogiem separacji)
+CREATE TABLE Detale_Zamowienia (
+    detal_id        INT             IDENTITY(1,1) PRIMARY KEY,
+    zamowienie_id   INT             NOT NULL CONSTRAINT FK_Detale_Zamowienie REFERENCES Zamowienie(zamowienie_id),
+    wozek_id        INT             NOT NULL CONSTRAINT FK_Detale_Wozek REFERENCES Wozek(wozek_id),
+    ilosc           INT             NOT NULL
+);
+
+-- 7. Wysyłka (Relacja 1:1 do Zamówienia)
+CREATE TABLE Wysylka (
+    wysylka_id      INT             IDENTITY(1,1) PRIMARY KEY,
+    zamowienie_id   INT             NOT NULL UNIQUE CONSTRAINT FK_Wysylka_Zamowienie REFERENCES Zamowienie(zamowienie_id),
+    status_wysylki  NVARCHAR(50)    NOT NULL DEFAULT 'W przygotowaniu',
+    data_wysylki    DATETIME        NULL
+);
+GO
+
+
+CREATE PROCEDURE dbo.ZlozZamowienie
+    @nazwisko NVARCHAR(50),
+    @wozek_id INT,
+    @ilosc INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @KlientID INT;
+    DECLARE @ElementyJedenWozek INT;
+    DECLARE @CalkowitaLiczbaElementow INT;
+    DECLARE @TerminRealizacji DATE;
+    DECLARE @DominujacyMaterial NVARCHAR(50);
+    
+    -- Zmienne do współczynnika złożoności
+    DECLARE @LiczbaRoznychCzesci INT;
+    DECLARE @SredniaLiczbaSztuk FLOAT;
+    DECLARE @LiczbaRoznychMaterialow INT;
+    DECLARE @Wspolczynnik DECIMAL(18,2);
+
+    DECLARE @NoweZamowienieID INT;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- 1. Obsługa klienta
+        SELECT @KlientID = klient_id FROM Klient WHERE nazwisko = @nazwisko;
+
+        IF @KlientID IS NULL
+        BEGIN
+            INSERT INTO Klient (nazwisko, imie, miasto) 
+            VALUES (@nazwisko, 'Nieznane', 'Nieznane');
+            SET @KlientID = SCOPE_IDENTITY();
+        END
+
+        -- 2a. Wyznaczenie liczby elementów dla 1 wózka
+        SELECT @ElementyJedenWozek = ISNULL(SUM(ilosc_sztuk), 0)
+        FROM Sklad_Wozka
+        WHERE wozek_id = @wozek_id;
+
+        -- Jeśli wózek nie ma składu, przerywamy (zabezpieczenie)
+        IF @ElementyJedenWozek = 0 THROW 50000, 'Wózek nie posiada zdefiniowanego składu!', 1;
+
+        -- 2b. Ustalenie terminu realizacji na podstawie CAŁKOWITEJ liczby elementów (zamówienia)
+        SET @CalkowitaLiczbaElementow = @ElementyJedenWozek * @ilosc;
+
+        IF @CalkowitaLiczbaElementow <= 50
+            SET @TerminRealizacji = DATEADD(DAY, 30, GETDATE());
+        ELSE IF @CalkowitaLiczbaElementow <= 100
+            SET @TerminRealizacji = DATEADD(DAY, 60, GETDATE());
+        ELSE IF @CalkowitaLiczbaElementow <= 1000
+            SET @TerminRealizacji = DATEADD(DAY, 90, GETDATE());
+        ELSE IF @CalkowitaLiczbaElementow <= 10000
+            SET @TerminRealizacji = DATEADD(MONTH, 6, GETDATE());
+        ELSE
+            SET @TerminRealizacji = DATEADD(YEAR, 2, GETDATE());
+
+        -- 2c. Wyznaczenie dominującego materiału
+        SELECT TOP 1 @DominujacyMaterial = c.material
+        FROM Sklad_Wozka sw
+        JOIN Czesc c ON sw.czesc_id = c.czesc_id
+        WHERE sw.wozek_id = @wozek_id
+        GROUP BY c.material
+        ORDER BY SUM(sw.ilosc_sztuk) DESC;
+
+        -- 2d. Wyznaczenie współczynnika złożoności konstrukcji
+        SELECT 
+            @LiczbaRoznychCzesci = COUNT(czesc_id),
+            @SredniaLiczbaSztuk = AVG(CAST(ilosc_sztuk AS FLOAT))
+        FROM Sklad_Wozka
+        WHERE wozek_id = @wozek_id;
+
+        SELECT @LiczbaRoznychMaterialow = COUNT(DISTINCT c.material)
+        FROM Sklad_Wozka sw
+        JOIN Czesc c ON sw.czesc_id = c.czesc_id
+        WHERE sw.wozek_id = @wozek_id;
+
+        SET @Wspolczynnik = @LiczbaRoznychCzesci * @SredniaLiczbaSztuk * @LiczbaRoznychMaterialow;
+
+        -- 3. Zapis zamówienia w bazie
+        INSERT INTO Zamowienie (klient_id, termin_realizacji, dominujacy_material, wspolczynnik_zlozonosci)
+        VALUES (@KlientID, @TerminRealizacji, @DominujacyMaterial, @Wspolczynnik);
+        
+        SET @NoweZamowienieID = SCOPE_IDENTITY();
+
+        INSERT INTO Detale_Zamowienia (zamowienie_id, wozek_id, ilosc)
+        VALUES (@NoweZamowienieID, @wozek_id, @ilosc);
+
+        INSERT INTO Wysylka (zamowienie_id)
+        VALUES (@NoweZamowienieID);
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        PRINT ERROR_MESSAGE();
+    END CATCH;
+END;
+GO
+
+DECLARE cur CURSOR FOR
+    SELECT nazwisko, wozek_id, ilosc FROM (
+        VALUES 
+            ('Kowalski', 1, 5),
+            ('Nowak', 2, 10),
+            ('Lewandowski', 1, 150),
+            ('Milik', 3, 2),
+            ('Szczesny', 2, 20)
+    ) AS DaneTestowe(nazwisko, wozek_id, ilosc);
+
+DECLARE @N NVARCHAR(50), @W INT, @I INT;
+
+OPEN cur;
+FETCH NEXT FROM cur INTO @N, @W, @I;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    EXEC dbo.ZlozZamowienie @nazwisko = @N, @wozek_id = @W, @ilosc = @I;
+    FETCH NEXT FROM cur INTO @N, @W, @I;
+END;
+
+CLOSE cur;
+DEALLOCATE cur;
+GO
+
+CREATE VIEW v_Top3MaterialyKategorii AS
+WITH KlasyfikacjaMaterialow AS (
+    SELECT 
+        w.kategoria,
+        c.material,
+        SUM(sw.ilosc_sztuk) as LacznieSztuk,
+        ROW_NUMBER() OVER(PARTITION BY w.kategoria ORDER BY SUM(sw.ilosc_sztuk) DESC) as PozycjaWRankingu
+    FROM Wozek w
+    JOIN Sklad_Wozka sw ON w.wozek_id = sw.wozek_id
+    JOIN Czesc c ON sw.czesc_id = c.czesc_id
+    GROUP BY w.kategoria, c.material
+)
+SELECT kategoria, material, LacznieSztuk 
+FROM KlasyfikacjaMaterialow
+WHERE PozycjaWRankingu <= 3;
+
+CREATE VIEW v_NajbardziejZlozoneWozki AS
+WITH RankingZlozonosci AS (
+    SELECT 
+        w.kategoria,
+        w.model,
+        MAX(z.wspolczynnik_zlozonosci) AS MaxWspolczynnik,
+        ROW_NUMBER() OVER(PARTITION BY w.kategoria ORDER BY MAX(z.wspolczynnik_zlozonosci) DESC) as Pozycja
+    FROM Wozek w
+    JOIN Detale_Zamowienia dz ON w.wozek_id = dz.wozek_id
+    JOIN Zamowienie z ON dz.zamowienie_id = z.zamowienie_id
+    GROUP BY w.kategoria, w.model
+)
+SELECT kategoria, model, MaxWspolczynnik
+FROM RankingZlozonosci
+WHERE Pozycja = 1;
+GO
+GO
+
+
+

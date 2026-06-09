@@ -1099,3 +1099,205 @@ BEGIN
 	END CATCH;
 END;
 ```
+
+Prepare SQL script including:
+Creation of tables and relations for the data model
+Adding a new column: IsReserved (bit) to HotelRooms and setting the default value to 0.
+Extending the HotelName column to 100 characters
+Insert of at least 2 rows into Hotels, 4 rows into HotelRooms and 4 rows into Reservations
+
+
+CREATE DATABASE HotelBookings;
+GO
+
+USE HotelBookings;
+GO
+
+-- 1. Tworzenie tabel zgodnie z modelem
+CREATE TABLE Hotels (
+	HotelCode       INT             PRIMARY KEY,
+	HotelName       VARCHAR(10)     NOT NULL,
+	City            VARCHAR(100)    NOT NULL,
+	Description     TEXT            NULL
+);
+
+CREATE TABLE HotelRooms (
+	RoomCode        INT             PRIMARY KEY,
+	HotelCode       INT             NOT NULL CONSTRAINT FK_Rooms_Hotels FOREIGN KEY REFERENCES Hotels(HotelCode),
+	NumberOfGuests  INT             NOT NULL,
+	CostOfANight    MONEY           NOT NULL
+);
+
+CREATE TABLE Reservations (
+	ReservationCode INT             IDENTITY(1,1) PRIMARY KEY,
+	RoomCode        INT             NOT NULL CONSTRAINT FK_Reservations_Rooms FOREIGN KEY REFERENCES HotelRooms(RoomCode),
+	DateFrom        DATE            NOT NULL,
+	DateTo          DATE            NOT NULL,
+	TotalCost       MONEY           NULL
+);
+GO
+
+-- 2. Dodanie nowej kolumny IsReserved (bit) z domyślną wartością 0
+ALTER TABLE HotelRooms
+	ADD IsReserved BIT NOT NULL CONSTRAINT DF_HotelRooms_IsReserved DEFAULT 0;
+
+-- 3. Zwiększenie długości kolumny HotelName do 100 znaków
+ALTER TABLE Hotels
+	ALTER COLUMN HotelName VARCHAR(100) NOT NULL;
+GO
+
+-- 4. Dodanie danych (INSERT)
+INSERT INTO Hotels (HotelCode, HotelName, City, Description) VALUES
+	(1, 'Grand Plaza', 'Warsaw', 'Luxury hotel in the city center'),
+	(2, 'Budget Inn', 'Warsaw', 'Cheap and clean rooms');
+
+INSERT INTO HotelRooms (RoomCode, HotelCode, NumberOfGuests, CostOfANight) VALUES
+	(101, 1, 2, 450.00),
+	(102, 1, 4, 800.00),
+	(201, 2, 2, 150.00),
+	(202, 2, 3, 200.00);
+
+INSERT INTO Reservations (RoomCode, DateFrom, DateTo, TotalCost) VALUES
+	(101, '2026-07-01', '2026-07-05', 1800.00),
+	(102, '2026-08-10', '2026-08-15', 4000.00),
+	(201, '2026-06-20', '2026-06-22', 300.00),
+	(202, '2026-09-01', '2026-09-05', 800.00);
+GO
+
+
+Prepare a stored procedure for the automatic reservation of hotel rooms (remember to design the transactional scope):
+The procedure accepts: name of the hotel, number of guests and the reservation dates.
+It searches for a free room matching the filtering criteria.
+If there is at least one available room, the procedure: 
+Creates a new record in Reservations table and calculates the total cost.
+Updates the reservation flag in Rooms table.
+Displays the newly inserted and updated rows on the output.
+If there are no available rooms, the procedure: 
+Searches for free rooms in other hotels in the same city.
+Displays the results on the output (HotelName, RoomCode, CostOfANight) . 
+
+
+CREATE PROCEDURE dbo.usp_ReserveRoom
+	@HotelName VARCHAR(100),
+	@NumberOfGuests INT,
+	@DateFrom DATE,
+	@DateTo DATE
+AS
+BEGIN
+	SET NOCOUNT ON;
+	-- Zabezpieczenie przed modyfikacją danych w locie przez innych użytkowników (Race condition)
+	SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+	DECLARE @FoundRoomCode INT;
+	DECLARE @CostPerNight MONEY;
+	DECLARE @TotalCost MONEY;
+	DECLARE @CityName VARCHAR(100);
+
+	-- Pobranie miasta docelowego (przyda się, jeśli pokój nie zostanie znaleziony)
+	SELECT @CityName = City FROM Hotels WHERE HotelName = @HotelName;
+
+	BEGIN TRANSACTION;
+	BEGIN TRY
+		
+		-- 1. Szukanie wolnego pokoju w docelowym hotelu
+		-- Szukamy pokoju, który: zgadza się nazwa hotelu, ma wystarczająco miejsc, IsReserved = 0
+		-- oraz daty nie nakładają się na istniejące rezerwacje (dla pełnego bezpieczeństwa)
+		SELECT TOP 1 
+			@FoundRoomCode = HR.RoomCode,
+			@CostPerNight = HR.CostOfANight
+		FROM HotelRooms HR
+		JOIN Hotels H ON HR.HotelCode = H.HotelCode
+		WHERE H.HotelName = @HotelName
+		  AND HR.NumberOfGuests >= @NumberOfGuests
+		  AND HR.IsReserved = 0
+		  AND NOT EXISTS (
+			  SELECT 1 FROM Reservations R
+			  WHERE R.RoomCode = HR.RoomCode
+				AND R.DateFrom < @DateTo 
+				AND R.DateTo > @DateFrom
+		  )
+		ORDER BY HR.CostOfANight ASC; -- Bierzemy najtańszy pasujący
+
+		IF @FoundRoomCode IS NOT NULL
+		BEGIN
+			-- Znaleziono pokój. Obliczamy całkowity koszt (liczba dni * cena za noc).
+			SET @TotalCost = DATEDIFF(DAY, @DateFrom, @DateTo) * @CostPerNight;
+			
+			-- Minimalny czas rezerwacji to 1 dzień
+			IF @TotalCost <= 0 SET @TotalCost = @CostPerNight; 
+
+			-- A) Tworzenie rezerwacji z jednoczesnym wyświetleniem wyniku (OUTPUT)
+			INSERT INTO Reservations (RoomCode, DateFrom, DateTo, TotalCost)
+			OUTPUT inserted.* VALUES (@FoundRoomCode, @DateFrom, @DateTo, @TotalCost);
+
+			-- B) Aktualizacja flagi IsReserved = 1 z jednoczesnym wyświetleniem wyniku (OUTPUT)
+			UPDATE HotelRooms
+			SET IsReserved = 1
+			OUTPUT inserted.*
+			WHERE RoomCode = @FoundRoomCode;
+
+		END
+		ELSE
+		BEGIN
+			-- 2. Brak pokoi. Szukamy alternatyw w tym samym mieście.
+			SELECT 
+				H.HotelName, 
+				HR.RoomCode, 
+				HR.CostOfANight
+			FROM HotelRooms HR
+			JOIN Hotels H ON HR.HotelCode = H.HotelCode
+			WHERE H.City = @CityName
+			  AND H.HotelName <> @HotelName
+			  AND HR.NumberOfGuests >= @NumberOfGuests
+			  AND HR.IsReserved = 0
+			  AND NOT EXISTS (
+				  SELECT 1 FROM Reservations R
+				  WHERE R.RoomCode = HR.RoomCode
+					AND R.DateFrom < @DateTo 
+					AND R.DateTo > @DateFrom
+			  );
+		END;
+
+		COMMIT;
+	END TRY
+	BEGIN CATCH
+		IF @@TRANCOUNT > 0 ROLLBACK;
+		
+		-- Wypisanie błędu na ekran
+		DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+		PRINT @ErrMsg;
+	END CATCH;
+END;
+GO
+
+
+Prepare a code implementing indexes for the following requirements (remember about specifying the indexing key, uniqueness, and clustering):
+Frequent joining of hotels and rooms.
+Uniqueness of a hotel name.
+Filtering rooms by the number of guests.
+Primary key in the table of reservations.
+Filtering reservations by start and end date together.
+
+
+-- 1. Częste łączenie hoteli i pokoi (klucz obcy z HotelRooms do Hotels)
+CREATE NONCLUSTERED INDEX idx_hotelrooms_hotelcode 
+	ON HotelRooms(HotelCode);
+
+-- 2. Unikalność nazwy hotelu
+CREATE UNIQUE NONCLUSTERED INDEX uidx_hotels_name 
+	ON Hotels(HotelName);
+
+-- 3. Filtrowanie pokoi po liczbie gości
+CREATE NONCLUSTERED INDEX idx_hotelrooms_guests 
+	ON HotelRooms(NumberOfGuests);
+
+-- 4. Klucz główny w tabeli rezerwacji
+-- Uwaga teoretyczna: Standardowe dodanie PRIMARY KEY automatycznie zakłada CLUSTERED INDEX.
+-- Aby jednak jawnie w kodzie zdefiniować i wymusić rodzaj indeksu na kluczu głównym (spełniając polecenie wykładowcy):
+ALTER TABLE Reservations 
+	ADD CONSTRAINT PK_Reservations PRIMARY KEY CLUSTERED (ReservationCode);
+
+-- 5. Filtrowanie rezerwacji po datach od-do łącznie (Indeks złożony)
+CREATE NONCLUSTERED INDEX idx_reservations_dates 
+	ON Reservations(DateFrom, DateTo);
+
